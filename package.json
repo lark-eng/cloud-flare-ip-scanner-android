@@ -1,0 +1,9 @@
+{
+  "name": "android-applet",
+  "version": "1.0.0",
+  "description": "Android Applet",
+  "scripts": {
+    "build": "echo 'Build Success'",
+    "dev": "echo 'Dev Success'"
+  }
+}

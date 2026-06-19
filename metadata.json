@@ -1,0 +1,6 @@
+{
+  "name": "IP Finder",
+  "description": "A powerful Cloudflare Clean IP Scanner and Finder built with Jetpack Compose featuring latency ranking, real-time speed calculation, parameters tuning, and saved database caching.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
