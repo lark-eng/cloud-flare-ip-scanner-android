@@ -224,7 +224,6 @@ object CloudflareScannerEngine {
     suspend fun scanIp(cfIp: CloudflareIp, timeoutMs: Int, sniHost: String? = null): ScanResult = withContext(Dispatchers.IO) {
         var latency = -1L
         var isClean = false
-        var speed = 0.0
 
         val securePorts = listOf(443, 2053, 2083, 2087, 2096, 8443)
         val isTlsPort = cfIp.port in securePorts
@@ -242,59 +241,168 @@ object CloudflareScannerEngine {
             isClean = true
 
             if (isTlsPort) {
-                sslSocket = trustAllSslSocketFactory.createSocket(
-                    rawSocket,
-                    cfIp.ip,
-                    cfIp.port,
-                    true
-                ) as SSLSocket
+                var handshakeSuccess = false
                 
-                val hostName = if (!sniHost.isNullOrEmpty()) {
-                    sniHost
-                } else {
-                    "cloudflare.com"
-                }
-
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                // If we have a custom sniHost, try handshaking with it first
+                if (!sniHost.isNullOrEmpty() && sniHost != "cloudflare.com") {
                     try {
-                        val sslParams = sslSocket.sslParameters
-                        sslParams.serverNames = listOf(javax.net.ssl.SNIHostName(hostName))
-                        sslSocket.sslParameters = sslParams
-                    } catch (ignored: Exception) {}
+                        sslSocket = trustAllSslSocketFactory.createSocket(
+                            rawSocket,
+                            cfIp.ip,
+                            cfIp.port,
+                            true
+                        ) as SSLSocket
+                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                            val sslParams = sslSocket.sslParameters
+                            sslParams.serverNames = listOf(javax.net.ssl.SNIHostName(sniHost))
+                            sslSocket.sslParameters = sslParams
+                        }
+                        sslSocket.soTimeout = timeoutMs
+                        sslSocket.startHandshake()
+                        handshakeSuccess = true
+                    } catch (e: Exception) {
+                        handshakeSuccess = false
+                        // Close these and try a fallback connection to verify if the IP is clean
+                        try { sslSocket?.close() } catch (ignored: Exception) {}
+                        try { rawSocket?.close() } catch (ignored: Exception) {}
+                        sslSocket = null
+                        rawSocket = null
+                    }
                 }
                 
-                sslSocket.soTimeout = timeoutMs
-                sslSocket.startHandshake()
+                // Fallback to "cloudflare.com" handshake if custom handshake wasn't done, or if it failed
+                if (!handshakeSuccess) {
+                    rawSocket = Socket()
+                    rawSocket.connect(address, timeoutMs)
+                    sslSocket = trustAllSslSocketFactory.createSocket(
+                        rawSocket,
+                        cfIp.ip,
+                        cfIp.port,
+                        true
+                    ) as SSLSocket
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                        try {
+                            val sslParams = sslSocket.sslParameters
+                            sslParams.serverNames = listOf(javax.net.ssl.SNIHostName("cloudflare.com"))
+                            sslSocket.sslParameters = sslParams
+                        } catch (ignored: Exception) {}
+                    }
+                    sslSocket.soTimeout = timeoutMs
+                    sslSocket.startHandshake()
+                    handshakeSuccess = true
+                }
             }
         } catch (e: Exception) {
             isClean = false
             latency = 9999L
-            speed = 0.0
         } finally {
             try { sslSocket?.close() } catch (ignored: Exception) {}
             try { rawSocket?.close() } catch (ignored: Exception) {}
-        }
-
-        if (isClean && latency > 0) {
-            // Highly refined bandwidth-latency translation curve matching exact physics
-            speed = when {
-                latency < 45 -> Random.nextDouble(48.0, 75.0)
-                latency < 90 -> Random.nextDouble(32.0, 47.8)
-                latency < 160 -> Random.nextDouble(18.0, 31.5)
-                latency < 320 -> Random.nextDouble(8.0, 17.8)
-                latency < 600 -> Random.nextDouble(2.5, 7.8)
-                latency < 1000 -> Random.nextDouble(0.5, 2.4)
-                else -> Random.nextDouble(0.1, 0.4)
-            }
         }
 
         ScanResult(
             ip = cfIp.ip,
             port = cfIp.port,
             latency = if (isClean) latency else 9999L,
-            speed = speed,
+            speed = 0.0,
             isClean = isClean
         )
+    }
+
+    /**
+     * Conducts a genuine HTTP/1.1 or TLS speed download test over cdnjs.cloudflare.com
+     * routed directly through the targeted Cloudflare IP. cdnjs.cloudflare.com is hosted 
+     * on Cloudflare's CDN network and is 100% unblocked in Iran, ensuring realistic measurements.
+     * This measures actual bytes read per millisecond, translating to authentic MB/s transfer speed.
+     */
+    suspend fun testActualSpeed(ip: String, port: Int, timeoutMs: Int): Double = withContext(Dispatchers.IO) {
+        var rawSocket: Socket? = null
+        var sslSocket: SSLSocket? = null
+        try {
+            val address = InetSocketAddress(ip, port)
+            rawSocket = Socket()
+            rawSocket.connect(address, timeoutMs)
+
+            val securePorts = listOf(443, 2053, 2083, 2087, 2096, 8443)
+            val isTls = port in securePorts
+
+            val inputStream = if (isTls) {
+                sslSocket = trustAllSslSocketFactory.createSocket(
+                    rawSocket,
+                    ip,
+                    port,
+                    true
+                ) as SSLSocket
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+                    try {
+                        val sslParams = sslSocket.sslParameters
+                        sslParams.serverNames = listOf(javax.net.ssl.SNIHostName("cdnjs.cloudflare.com"))
+                        sslSocket.sslParameters = sslParams
+                    } catch (ignored: Exception) {}
+                }
+                sslSocket.soTimeout = timeoutMs
+                sslSocket.startHandshake()
+                sslSocket.inputStream
+            } else {
+                rawSocket.soTimeout = timeoutMs
+                rawSocket.inputStream
+            }
+
+            val outputStream = if (isTls) sslSocket!!.outputStream else rawSocket.outputStream
+
+            // Request 600 KB library (three.min.js) from Cloudflare cdnjs CDN
+            val request = "GET /ajax/libs/three.js/r128/three.min.js HTTP/1.1\r\n" +
+                    "Host: cdnjs.cloudflare.com\r\n" +
+                    "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36\r\n" +
+                    "Accept: */*\r\n" +
+                    "Connection: close\r\n\r\n"
+
+            outputStream.write(request.toByteArray(Charsets.US_ASCII))
+            outputStream.flush()
+
+            val buffer = ByteArray(8192)
+            var totalBytesRead = 0L
+            val startTime = System.currentTimeMillis()
+            var bodyStarted = false
+
+            while (true) {
+                val now = System.currentTimeMillis()
+                if (now - startTime > 3000) { // Max 3 seconds per IP to keep testing performant and avoid UI/coroutine freezing
+                    break
+                }
+                val read = inputStream.read(buffer)
+                if (read == -1) break
+
+                if (!bodyStarted) {
+                    // Quick ASCII search for double CRLF terminating headers
+                    val str = String(buffer, 0, read, Charsets.US_ASCII)
+                    val bodyIndex = str.indexOf("\r\n\r\n")
+                    if (bodyIndex != -1) {
+                        bodyStarted = true
+                        val headersLength = bodyIndex + 4
+                        totalBytesRead += (read - headersLength)
+                    }
+                } else {
+                    totalBytesRead += read
+                }
+            }
+
+            val durationMs = System.currentTimeMillis() - startTime
+            if (totalBytesRead <= 0 || durationMs < 50L) {
+                return@withContext 0.0
+            }
+
+            // Calculate MB/s: Megabytes per second
+            // bytes / (1024 * 1024) divided by seconds (durationMs / 1000.0)
+            val speedMbs = (totalBytesRead.toDouble() / (1024.0 * 1024.0)) / (durationMs.toDouble() / 1000.0)
+            val result = if (speedMbs > 150.0) 0.0 else speedMbs // Filter out anomaly/socket caching
+            return@withContext result
+        } catch (e: Exception) {
+            return@withContext 0.0
+        } finally {
+            try { sslSocket?.close() } catch (ignored: Exception) {}
+            try { rawSocket?.close() } catch (ignored: Exception) {}
+        }
     }
 
     suspend fun runSubnetScan(

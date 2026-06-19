@@ -520,33 +520,7 @@ fun ScannerMainScreen(
                             )
                         }
 
-                        if (isSpeedTestEnabled) {
-                            Column {
-                                Text(
-                                    if (isPersian) "تعداد آی‌پی‌های برتر جهت تست سرعت خودکار" else "Auto-Speed Test Limit (top IPs)",
-                                    style = MaterialTheme.typography.labelSmall.copy(color = AccentCyan)
-                                )
-                                Spacer(modifier = Modifier.height(6.dp))
-                                TextField(
-                                    value = speedTestLimit.toString(),
-                                    onValueChange = {
-                                        val checked = it.toIntOrNull() ?: 10
-                                        viewModel.updateSpeedTestLimit(checked)
-                                    },
-                                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
-                                    modifier = Modifier.fillMaxWidth(),
-                                    shape = RoundedCornerShape(16.dp),
-                                    colors = TextFieldDefaults.colors(
-                                        focusedContainerColor = SurfaceVariantBg,
-                                        unfocusedContainerColor = SurfaceVariantBg,
-                                        focusedTextColor = TextPrimary,
-                                        unfocusedTextColor = TextPrimary,
-                                        focusedIndicatorColor = Color.Transparent,
-                                        unfocusedIndicatorColor = Color.Transparent
-                                    )
-                                )
-                            }
-                        }
+
                     }
                 },
                 confirmButton = {
@@ -1309,7 +1283,17 @@ fun ResultRow(
             modifier = Modifier.weight(1.1f),
             contentAlignment = Alignment.CenterEnd
         ) {
-            if (speed > 0.0) {
+            if (speed == -1.0) {
+                Text(
+                    text = if (isPersian) "درحال بررسی..." else "Testing...",
+                    style = MaterialTheme.typography.bodySmall.copy(
+                        color = AccentTeal,
+                        fontWeight = FontWeight.Normal,
+                        fontStyle = androidx.compose.ui.text.font.FontStyle.Italic
+                    ),
+                    textAlign = TextAlign.End
+                )
+            } else if (speed > 0.0) {
                 Text(
                     text = String.format(Locale.US, "%.1f MB/s", speed),
                     style = MaterialTheme.typography.bodyMedium.copy(

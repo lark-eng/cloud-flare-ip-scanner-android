@@ -10,6 +10,7 @@ import com.example.scanner.CloudflareScannerEngine
 import com.example.scanner.ScanResult
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -147,6 +148,9 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     // Scanning Job Reference for cancellation
     private var scanJob: Job? = null
 
+    // Set to prevent duplicate concurrent speed download tasks
+    private val speedTestingIps = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+
     init {
         // Populate default IP guidelines list to encourage prompt action
         val defaultHostsBuilder = StringBuilder()
@@ -234,47 +238,150 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
 
     fun updateSpeedTestEnabled(enabled: Boolean) {
         _isSpeedTestEnabled.value = enabled
+        reapplySpeedLimits()
     }
 
     fun updateSpeedTestLimit(limit: Int) {
         _speedTestLimit.value = limit
+        reapplySpeedLimits()
     }
 
-    fun runManualSpeedTest(ip: String) {
-        viewModelScope.launch(Dispatchers.Default) {
+    private fun updateIpSpeedState(ip: String, speed: Double) {
+        viewModelScope.launch(Dispatchers.Main) {
             val currentList = _activeScanResults.value.toMutableList()
             val index = currentList.indexOfFirst { it.ip == ip }
             if (index != -1) {
-                val item = currentList[index]
-                val calculatedSpeed = when {
-                    item.latency < 45 -> kotlin.random.Random.nextDouble(48.0, 75.0)
-                    item.latency < 90 -> kotlin.random.Random.nextDouble(32.0, 47.8)
-                    item.latency < 160 -> kotlin.random.Random.nextDouble(18.0, 31.5)
-                    item.latency < 320 -> kotlin.random.Random.nextDouble(8.0, 17.8)
-                    item.latency < 600 -> kotlin.random.Random.nextDouble(2.5, 7.8)
-                    item.latency < 1000 -> kotlin.random.Random.nextDouble(0.5, 2.4)
-                    else -> kotlin.random.Random.nextDouble(0.1, 0.4)
-                }
-                currentList[index] = item.copy(speed = calculatedSpeed)
+                currentList[index] = currentList[index].copy(speed = speed)
                 _activeScanResults.value = currentList
+            }
+        }
+    }
 
-                // Synchronize custom speed to Room database manually
-                viewModelScope.launch(Dispatchers.IO) {
-                    dao.insertIp(
-                        SavedIpEntity(
-                            ip = item.ip,
-                            latency = item.latency,
-                            speed = calculatedSpeed,
-                            port = item.port
-                        )
+    private fun runBackgroundSpeedTest(item: ScanResult) {
+        val ip = item.ip
+        if (!speedTestingIps.add(ip)) {
+            return // Already testing or tested
+        }
+
+        // Mark as testing (-1.0) in our active results state flow
+        updateIpSpeedState(ip, -1.0)
+
+        viewModelScope.launch(Dispatchers.Default) {
+            logEvent(
+                "Starting actual speed test for $ip via unblocked speedtest/cdnjs servers...",
+                "در حال تست سرعت واقعی آی‌پی $ip از طریق CDN کلادفلر بدون فیلتر...",
+                LiveEventType.SCAN
+            )
+
+            // Perform the heavy network request using CloudflareScannerEngine
+            val realSpeed = CloudflareScannerEngine.testActualSpeed(
+                ip = ip,
+                port = item.port,
+                timeoutMs = _timeoutMs.value.coerceAtLeast(3000) // Ensure enough time for a solid download
+            )
+
+            // Speed test completed. Show in log and update state
+            updateIpSpeedState(ip, realSpeed)
+
+            logEvent(
+                "Real speed test finished for $ip: ${String.format(Locale.US, "%.2f", realSpeed)} MB/s",
+                "تست سرعت واقعی برای $ip پایان یافت: ${String.format(Locale.US, "%.2f", realSpeed)} مگابایت بر ثانیه",
+                LiveEventType.SCAN
+            )
+
+            // Save/update this record in Room database
+            viewModelScope.launch(Dispatchers.IO) {
+                dao.insertIp(
+                    SavedIpEntity(
+                        ip = ip,
+                        latency = item.latency,
+                        speed = realSpeed,
+                        port = item.port
                     )
+                )
+            }
+        }
+    }
+
+    private fun reapplySpeedLimits() {
+        val current = _activeScanResults.value
+        if (current.isEmpty()) return
+        val speedEnabled = _isSpeedTestEnabled.value
+        val limit = _speedTestLimit.value
+        
+        val sortedList = current.sortedBy { it.latency }
+        val updatedList = sortedList.mapIndexed { index, item ->
+            val shouldHaveSpeed = speedEnabled && index < limit
+            if (shouldHaveSpeed) {
+                if (item.speed <= 0.0 && item.speed != -1.0) {
+                    runBackgroundSpeedTest(item)
+                    item.copy(speed = -1.0)
+                } else {
+                    item
                 }
+            } else {
+                if (item.speed > 0.0 && item.speed != -1.0) {
+                    item.copy(speed = 0.0)
+                } else {
+                    item
+                }
+            }
+        }
+        _activeScanResults.value = updatedList
+    }
+
+    fun runManualSpeedTest(ip: String) {
+        viewModelScope.launch(Dispatchers.Main) {
+            val currentList = _activeScanResults.value.toMutableList()
+            val index = currentList.indexOfFirst { it.ip == ip }
+            if (index != -1) {
+                val originalItem = currentList[index]
+                if (speedTestingIps.contains(ip)) return@launch // Already running
+                
+                // Mark as testing
+                currentList[index] = originalItem.copy(speed = -1.0)
+                _activeScanResults.value = currentList
+                speedTestingIps.add(ip)
                 
                 logEvent(
-                    "Manual speed test complete for $ip: ${String.format(Locale.US, "%.2f", calculatedSpeed)} MB/s",
-                    "تست سرعت دستی برای $ip خاتمه یافت: ${String.format(Locale.US, "%.2f", calculatedSpeed)} مگابایت بر ثانیه",
+                    "Starting manual speed test for $ip...",
+                    "شروع تست سرعت دستی برای $ip...",
                     LiveEventType.SCAN
                 )
+                
+                viewModelScope.launch(Dispatchers.Default) {
+                    val realSpeed = CloudflareScannerEngine.testActualSpeed(
+                        ip = originalItem.ip,
+                        port = originalItem.port,
+                        timeoutMs = _timeoutMs.value.coerceAtLeast(3000)
+                    )
+                    
+                    val updatedList = _activeScanResults.value.toMutableList()
+                    val idx = updatedList.indexOfFirst { it.ip == ip }
+                    if (idx != -1) {
+                        val updatedItem = updatedList[idx].copy(speed = realSpeed)
+                        updatedList[idx] = updatedItem
+                        _activeScanResults.value = updatedList
+
+                        // Synchronize to DB
+                        viewModelScope.launch(Dispatchers.IO) {
+                            dao.insertIp(
+                                SavedIpEntity(
+                                    ip = updatedItem.ip,
+                                    latency = updatedItem.latency,
+                                    speed = updatedItem.speed,
+                                    port = updatedItem.port
+                                )
+                            )
+                        }
+                        
+                        logEvent(
+                            "Manual speed test complete for $ip: ${String.format(Locale.US, "%.2f", realSpeed)} MB/s",
+                            "تست سرعت دستی برای $ip خاتمه یافت: ${String.format(Locale.US, "%.2f", realSpeed)} مگابایت بر ثانیه",
+                            LiveEventType.SCAN
+                        )
+                    }
+                }
             }
         }
     }
@@ -282,6 +389,7 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     fun startScanning() {
         // Cancel any current job
         scanJob?.cancel()
+        speedTestingIps.clear()
 
         val rawInput = _ipInputList.value
         val poolSize = _ipPoolSizeToGenerate.value
@@ -345,33 +453,18 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
                     val sortedActive = rawCleanList.mapIndexed { index, item ->
                         val shouldHaveSpeed = speedEnabled && index < limit
                         if (shouldHaveSpeed) {
-                            if (item.speed <= 0.0) {
-                                val calculatedSpeed = when {
-                                    item.latency < 45 -> kotlin.random.Random.nextDouble(48.0, 75.0)
-                                    item.latency < 90 -> kotlin.random.Random.nextDouble(32.0, 47.8)
-                                    item.latency < 160 -> kotlin.random.Random.nextDouble(18.0, 31.5)
-                                    item.latency < 320 -> kotlin.random.Random.nextDouble(8.0, 17.8)
-                                    item.latency < 600 -> kotlin.random.Random.nextDouble(2.5, 7.8)
-                                    item.latency < 1000 -> kotlin.random.Random.nextDouble(0.5, 2.4)
-                                    else -> kotlin.random.Random.nextDouble(0.1, 0.4)
-                                }
-                                val updated = item.copy(speed = calculatedSpeed)
-                                viewModelScope.launch(Dispatchers.IO) {
-                                    dao.insertIp(
-                                        SavedIpEntity(
-                                            ip = updated.ip,
-                                            latency = updated.latency,
-                                            speed = updated.speed,
-                                            port = updated.port
-                                        )
-                                    )
-                                }
-                                updated
+                            if (item.speed <= 0.0 && item.speed != -1.0) {
+                                runBackgroundSpeedTest(item)
+                                item.copy(speed = -1.0)
                             } else {
                                 item
                             }
                         } else {
-                            item
+                            if (item.speed > 0.0 && item.speed != -1.0) {
+                                item.copy(speed = 0.0)
+                            } else {
+                                item
+                            }
                         }
                     }
                     _activeScanResults.value = sortedActive
