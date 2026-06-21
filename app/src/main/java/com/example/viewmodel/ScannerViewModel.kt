@@ -182,6 +182,44 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
     private val _speedTestLimit = MutableStateFlow(10)
     val speedTestLimit = _speedTestLimit.asStateFlow()
 
+    // Multi-select state for live/active scan results
+    private val _selectedActiveIps = MutableStateFlow<Set<String>>(emptySet())
+    val selectedActiveIps = _selectedActiveIps.asStateFlow()
+
+    // Multi-select state for saved database registry
+    private val _selectedSavedIps = MutableStateFlow<Set<String>>(emptySet())
+    val selectedSavedIps = _selectedSavedIps.asStateFlow()
+
+    // Retesting set
+    private val _retestingSavedIps = MutableStateFlow<Set<String>>(emptySet())
+    val retestingSavedIps = _retestingSavedIps.asStateFlow()
+
+    fun toggleActiveIpSelection(ip: String) {
+        val current = _selectedActiveIps.value
+        _selectedActiveIps.value = if (current.contains(ip)) {
+            current - ip
+        } else {
+            current + ip
+        }
+    }
+
+    fun clearActiveIpSelection() {
+        _selectedActiveIps.value = emptySet()
+    }
+
+    fun toggleSavedIpSelection(ip: String) {
+        val current = _selectedSavedIps.value
+        _selectedSavedIps.value = if (current.contains(ip)) {
+            current - ip
+        } else {
+            current + ip
+        }
+    }
+
+    fun clearSavedIpSelection() {
+        _selectedSavedIps.value = emptySet()
+    }
+
     // Temporary list of scanned results during the lifetime of current execution session
     private val _activeScanResults = MutableStateFlow<List<ScanResult>>(emptyList())
     val activeScanResults = _activeScanResults.asStateFlow()
@@ -602,5 +640,73 @@ class ScannerViewModel(application: Application) : AndroidViewModel(application)
             "تمامی تاریخچه و لیست آی‌پی‌های ذخیره شده به کلی از دیتابیس پاک شد.",
             LiveEventType.DATABASE
         )
+    }
+
+    fun retestSavedIp(entity: SavedIpEntity) {
+        val ip = entity.ip
+        if (_retestingSavedIps.value.contains(ip)) return
+        
+        _retestingSavedIps.value = _retestingSavedIps.value + ip
+        
+        viewModelScope.launch(Dispatchers.Default) {
+            try {
+                logEvent(
+                    "Re-testing Saved IP $ip...",
+                    "در حال تست مجدد آی‌پی ذخیره‌شده $ip...",
+                    LiveEventType.SCAN
+                )
+                
+                // First do a scanIp to get the latest latency
+                val parsed = parseVlessTrojanConfig(_configInput.value)
+                val bestSni = parsed?.getBestSni()
+                val scanRes = CloudflareScannerEngine.scanIp(
+                    cfIp = com.example.scanner.CloudflareIp(ip = ip, port = entity.port),
+                    timeoutMs = _timeoutMs.value,
+                    sniHost = bestSni
+                )
+                
+                var newLatency = scanRes.latency
+                var newSpeed = 0.0
+                
+                if (scanRes.isClean && scanRes.latency < _timeoutMs.value) {
+                    // If clean, then run speed test
+                    newSpeed = CloudflareScannerEngine.testActualSpeed(
+                        ip = ip,
+                        port = entity.port,
+                        timeoutMs = _timeoutMs.value.coerceAtLeast(3000)
+                    )
+                } else {
+                    newLatency = -1L // failed or timed out
+                    newSpeed = 0.0
+                }
+                
+                // update in DB
+                viewModelScope.launch(Dispatchers.IO) {
+                    dao.insertIp(
+                        SavedIpEntity(
+                            ip = ip,
+                            latency = newLatency,
+                            speed = newSpeed,
+                            port = entity.port,
+                            timestamp = System.currentTimeMillis()
+                        )
+                    )
+                }
+                
+                logEvent(
+                    "Completed re-test for saved IP $ip. New Latency: ${if (newLatency > 0) "$newLatency ms" else "Failed"}, Speed: ${String.format(Locale.US, "%.2f", newSpeed)} MB/s",
+                    "تست مجدد آی‌پی ذخیره‌شده $ip پایان یافت. پینگ: ${if (newLatency > 0) "$newLatency میلی‌ثانیه" else "ناموفق"}، سرعت: ${String.format(Locale.US, "%.2f", newSpeed)} مگابایت بر ثانیه",
+                    LiveEventType.SCAN
+                )
+            } catch (e: Exception) {
+                logEvent(
+                    "Failed to re-test saved IP $ip: ${e.localizedMessage}",
+                    "خطا در تست مجدد آی‌پی ذخیره‌شده $ip: ${e.localizedMessage}",
+                    LiveEventType.ERROR
+                )
+            } finally {
+                _retestingSavedIps.value = _retestingSavedIps.value - ip
+            }
+        }
     }
 }
